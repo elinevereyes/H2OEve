@@ -39,6 +39,10 @@ from llm_studio.src.utils.data_utils import (
 )
 from llm_studio.src.utils.exceptions import LLMDataException, LLMModelException
 from llm_studio.src.utils.logging_utils import TqdmToLogger
+from llm_studio.src.utils.monkey_patch import (
+    MixtralSparseMoeBlock,
+    monkey_patch_backbone,
+)
 from llm_studio.src.utils.utils import save_pickle
 
 logger = logging.getLogger(__name__)
@@ -288,6 +292,26 @@ def get_ds_config(cfg: Any):
     #         {"device": "cpu", "pin_memory": True}
 
     return ds_config
+
+
+def adjust_model_gradients(model: torch.nn.Module, cfg: Any):
+    """Adjusts parameter gradients if required"""
+
+    if getattr(cfg.architecture, "force_embedding_gradients", False):
+        for module in model.modules():
+            if isinstance(module, torch.nn.Embedding):
+                for param in module.parameters():
+                    param.requires_grad = True
+                    param.data = param.data.float()
+
+    if getattr(cfg.architecture, "force_gate_gradients", False):
+        for name, module in model.named_modules():
+            if "gate" in name:
+                for param in module.parameters():
+                    # param.data = param.data.float()
+                    param.requires_grad = True
+
+    return model
 
 
 def wrap_model_distributed(
@@ -661,6 +685,21 @@ def update_backbone_config(config: Any, cfg: Any):
     if "mpt-" in cfg.llm_backbone:
         config.init_device = cfg.environment._device
 
+    if getattr(cfg.architecture, "moe_model", False):
+        config.output_router_logits = True
+
+        if cfg.architecture.num_experts_per_tok == -1:
+            cfg.architecture.num_experts_per_tok = config.num_experts_per_tok
+        if cfg.architecture.num_experts_per_tok_train == -1:
+            cfg.architecture.num_experts_per_tok_train = (
+                cfg.architecture.num_experts_per_tok
+            )
+
+        config.num_experts_per_tok = cfg.architecture.num_experts_per_tok
+        config.num_experts_per_tok_train = cfg.architecture.num_experts_per_tok_train
+        config.random_expert_shuffle = cfg.augmentation.random_expert_shuffle
+        cfg.architecture._num_local_experts = config.num_local_experts
+
     # See: https://github.com/huggingface/transformers/pull/24906
     if hasattr(config, "pretraining_tp") and cfg.training.lora:
         logger.info("Setting pretraining_tp of model config to 1.")
@@ -675,6 +714,9 @@ def create_nlp_backbone(cfg, model_class=AutoModel) -> Any:
     This is needed for Gradient Checkpointing in DDP mode.
     """
     kwargs = dict()
+
+    monkey_patch_backbone(cfg)
+
     try:
         config = AutoConfig.from_pretrained(
             cfg.llm_backbone,
@@ -700,6 +742,9 @@ def create_nlp_backbone(cfg, model_class=AutoModel) -> Any:
         quantization_config = BitsAndBytesConfig(
             load_in_8bit=True,
             llm_int8_threshold=0.0,
+            llm_int8_skip_modules=["gate"]
+            if getattr(cfg.architecture, "force_gate_gradients", False)
+            else None,
         )
         # need to force pretrained
         cfg.architecture.pretrained = True
@@ -710,6 +755,9 @@ def create_nlp_backbone(cfg, model_class=AutoModel) -> Any:
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_quant_type="nf4",
+            llm_int8_skip_modules=["gate"]
+            if getattr(cfg.architecture, "force_gate_gradients", False)
+            else None,
         )
         # need to force pretrained
         cfg.architecture.pretrained = True
@@ -958,12 +1006,9 @@ def prepare_lora(cfg, backbone):
     if target_modules is None:
         target_modules = []
         for name, module in backbone.named_modules():
-            if (
-                isinstance(
-                    module, (torch.nn.Linear, torch.nn.Conv1d, Conv1DTransformer)
-                )
-                and "head" not in name
-            ):
+            if isinstance(
+                module, (torch.nn.Linear, torch.nn.Conv1d, Conv1DTransformer)
+            ) and all(substring not in name for substring in ["head", "gate"]):
                 name = name.split(".")[-1]
                 if name not in target_modules:
                     target_modules.append(name)
@@ -1030,6 +1075,10 @@ def generate(backbone, batch, cfg, streamer, remove_prompt=True):
         repetition_penalty=(float(cfg.prediction.repetition_penalty)),
         top_k=cfg.prediction.top_k,
         top_p=float(cfg.prediction.top_p),
+        max_time=cfg.prediction.max_time if cfg.prediction.max_time > 0 else None,
+        prompt_lookup_num_tokens=cfg.prediction.prompt_lookup_num_tokens
+        if cfg.prediction.prompt_lookup_num_tokens > 0
+        else None,
         stopping_criteria=stopping_criteria,
         renormalize_logits=True,
         return_dict_in_generate=False,

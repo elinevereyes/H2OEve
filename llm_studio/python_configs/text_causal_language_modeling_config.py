@@ -131,6 +131,7 @@ class ConfigNLPCausalLMDataset(DefaultConfig):
 class ConfigNLPCausalLMTraining(DefaultConfig):
     loss_class: Any = text_causal_language_modeling_losses.Losses
     loss_function: str = "TokenAveragedCrossEntropy"
+    router_aux_loss_coef: float = 0.0
     optimizer: str = "AdamW"
 
     learning_rate: float = 0.0001
@@ -170,13 +171,14 @@ class ConfigNLPCausalLMTraining(DefaultConfig):
         self._possible_values[
             "differential_learning_rate_layers"
         ] = possible_values.String(
-            values=("backbone", "embed"),
+            values=("backbone", "embed", "gate"),
             allow_custom=False,
             placeholder="Select optional layers...",
         )
         self._possible_values["differential_learning_rate"] = self._possible_values[
             "learning_rate"
         ]
+        self._possible_values["router_aux_loss_coef"] = (0.0, 2.0, 0.01)
 
         self._possible_values["batch_size"] = (1, 256, 1)
         self._possible_values["epochs"] = (0, 10, 1)
@@ -214,6 +216,10 @@ class ConfigNLPCausalLMTraining(DefaultConfig):
             ["train_validation_data"],
             [Dependency(key="save_best_checkpoint", value=False, is_set=True)],
         )
+        self._nesting.add(
+            ["router_aux_loss_coef"],
+            [Dependency(key="moe_model", value=True, is_set=True)],
+        )
 
 
 @dataclass
@@ -242,10 +248,14 @@ class ConfigNLPCausalLMArchitecture(DefaultConfig):
     model_class: Any = text_causal_language_modeling_model.Model
     pretrained: bool = True
 
+    moe_model: bool = False
     backbone_dtype: str = "int4"
     gradient_checkpointing: bool = True
     force_embedding_gradients: bool = False
+    force_gate_gradients: bool = False
     intermediate_dropout: float = 0
+    num_experts_per_tok: int = -1
+    num_experts_per_tok_train: int = -1
     pretrained_weights: str = ""
 
     def __post_init__(self):
@@ -256,10 +266,20 @@ class ConfigNLPCausalLMArchitecture(DefaultConfig):
             allow_custom=False,
         )
         self._possible_values["intermediate_dropout"] = (0, 0.5, 0.05)
+        self._possible_values["num_experts_per_tok"] = (-1, 8, 1)
+        self._possible_values["num_experts_per_tok_train"] = (-1, 8, 1)
 
         self._nesting.add(
             ["force_embedding_gradients"],
             [Dependency(key="lora", value=False, is_set=False)],
+        )
+        self._nesting.add(
+            [
+                "force_gate_gradients",
+                "num_experts_per_tok",
+                "num_experts_per_tok_train",
+            ],
+            [Dependency(key="moe_model", value=True, is_set=True)],
         )
 
         self._visibility["model_class"] = -1
@@ -272,6 +292,7 @@ class ConfigNLPAugmentation(DefaultConfig):
     token_mask_probability: float = 0.0
     skip_parent_probability: float = 0.0
     random_parent_probability: float = 0.0
+    random_expert_shuffle: float = 0.0
     neftune_noise_alpha: float = 0.0
 
     def __post_init__(self):
@@ -279,8 +300,14 @@ class ConfigNLPAugmentation(DefaultConfig):
         self._possible_values["token_mask_probability"] = (0.0, 0.9, 0.05)
         self._possible_values["skip_parent_probability"] = (0.0, 1.0, 0.05)
         self._possible_values["random_parent_probability"] = (0.0, 1.0, 0.05)
+        self._possible_values["random_expert_shuffle"] = (0.0, 1.0, 0.05)
         self._possible_values["neftune_noise_alpha"] = (0.0, 15, 0.05)
         self._visibility["nlp_augmentations_class"] = -1
+
+        self._nesting.add(
+            ["random_expert_shuffle"],
+            [Dependency(key="moe_model", value=True, is_set=True)],
+        )
 
 
 @dataclass
@@ -301,6 +328,8 @@ class ConfigNLPCausalLMPrediction(DefaultConfig):
     stop_tokens: str = ""
     top_k: int = 0
     top_p: float = 1.0
+    max_time: int = 0
+    prompt_lookup_num_tokens: int = 0
 
     num_history: int = 4
 
@@ -333,6 +362,8 @@ class ConfigNLPCausalLMPrediction(DefaultConfig):
         self._possible_values["repetition_penalty"] = (1, 10, 0.05)
         self._possible_values["top_k"] = (0, 100, 1)
         self._possible_values["top_p"] = (0.5, 1, 0.05)
+        self._possible_values["max_time"] = (0, 600, 30)
+        self._possible_values["prompt_lookup_num_tokens"] = (0, 50, 1)
         self._possible_values["num_history"] = (1, 50, 1)
 
         self._visibility["metric_class"] = -1
